@@ -1,4 +1,3 @@
-# OnDemandwithRealtime
 
 
 # DrugInfoService & DrugDealer — Specification Document
