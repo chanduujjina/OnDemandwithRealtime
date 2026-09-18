@@ -1,5 +1,3 @@
-
-
 # DrugInfoService & DrugDealer — Specification Document
 
 ## 1. Architecture Overview
@@ -149,21 +147,24 @@ CREATE TABLE consumed_drug_events (
 
 **Topic name (placeholder-configurable):** `${KAFKA_TOPIC_DRUG_INFO}` → default value `drugInfo`
 
-### Producer — DrugInfoService
+### Producer — DrugInfoService (Spring Cloud Stream, Kafka binder)
 
-- Triggered immediately after a successful MySQL persist within the `/saveDrugInfo` request flow.
-- Uses `KafkaTemplate<String, DrugInfoEvent>` (JSON serialization via `JsonSerializer`).
-- **Message key:** `eventId` (String) — ensures partition affinity per event.
-- **Delivery semantics:** at-least-once (producer acks = `all`, retries enabled).
+- Implemented using **Spring Cloud Stream's** functional programming model with the **Kafka binder** (`spring-cloud-stream-binder-kafka`) — not raw `KafkaTemplate`.
+- Publishing is performed via `StreamBridge.send(String bindingName, Message<DrugInfoEvent> message)`, invoked immediately after a successful MySQL persist within the `/saveDrugInfo` request flow.
+- **Binding name:** `drugInfoProducer-out-0` (suggested; configurable), bound to destination `${KAFKA_TOPIC_DRUG_INFO}` via `spring.cloud.stream.bindings.drugInfoProducer-out-0.destination`.
+- **Message key:** `eventId` (String) — set via the Kafka-specific message header `KafkaHeaders.KEY` (or `spring.cloud.stream.kafka.bindings.drugInfoProducer-out-0.producer.messageKeyExpression`), ensuring partition affinity per event.
+- **Serialization:** JSON, via Spring Cloud Stream's default `application/json` content-type conversion (no manual `JsonSerializer` wiring required).
+- **Delivery semantics:** at-least-once (Kafka producer `acks=all`, retries enabled via `spring.cloud.stream.kafka.binder.producer-properties`).
 - Failure to publish does **not** roll back the MySQL write or fail the REST response; publish failures are logged and (optionally) routed to a dead-letter mechanism in a later phase.
 
-### Consumer — DrugDealer
+### Consumer — DrugDealer (Spring Cloud Stream, Kafka binder)
 
-- `@KafkaListener` bound to topic `${KAFKA_TOPIC_DRUG_INFO}`, consumer group `${KAFKA_CONSUMER_GROUP_DRUGDEALER}` (e.g. `drugdealer-group`).
-- Deserializes JSON payload into `DrugInfoEvent` (via `JsonDeserializer`, trusted packages configured explicitly — no wildcard trust).
-- On successful deserialization, maps envelope + nested `data` fields into `ConsumedDrugEvent` and persists via `ConsumedDrugEventRepository.save(...)`.
-- Manual or auto ack per configured `AckMode` (recommend `MANUAL_IMMEDIATE` for phase where reliability is emphasized; `RECORD` acceptable for initial phases).
-- Malformed/unparseable messages are routed to error handling (log + optional DLT topic `drugInfo.DLT`), not silently dropped.
+- Implemented as a Spring Cloud Stream **functional consumer** — a `java.util.function.Consumer<DrugInfoEvent>` bean (suggested bean name `drugInfoConsumer`) — rather than a raw `@KafkaListener`. Spring Cloud Stream auto-registers this bean as a binding.
+- **Binding name:** `drugInfoConsumer-in-0`, bound to destination `${KAFKA_TOPIC_DRUG_INFO}` via `spring.cloud.stream.bindings.drugInfoConsumer-in-0.destination`, consumer group `${KAFKA_CONSUMER_GROUP_DRUGDEALER}` (e.g. `drugdealer-group`) set via `spring.cloud.stream.bindings.drugInfoConsumer-in-0.group`.
+- Deserializes JSON payload into `DrugInfoEvent` automatically via Spring Cloud Stream's message conversion (content-type `application/json`); no manual `JsonDeserializer`/trusted-packages configuration required, since conversion happens at the Spring Cloud Stream layer rather than the native Kafka deserializer layer.
+- On successful conversion, the `Consumer<DrugInfoEvent>` bean maps envelope + nested `data` fields into `ConsumedDrugEvent` and persists via `ConsumedDrugEventRepository.save(...)`.
+- Acknowledgment mode configured via `spring.cloud.stream.kafka.bindings.drugInfoConsumer-in-0.consumer.ackMode` (e.g. `MANUAL` for phases emphasizing reliability; default batch/record ack acceptable for initial phases).
+- Malformed/unparseable messages are routed to error handling via Spring Cloud Stream's binder-level error channel (`spring.cloud.stream.kafka.bindings.drugInfoConsumer-in-0.consumer.enableDlq: true`, publishing to DLQ topic `${KAFKA_TOPIC_DRUG_INFO}.DLQ`), not silently dropped.
 
 ### Event Envelope Schema
 
@@ -277,7 +278,7 @@ DrugInfoService makes outbound calls to an external/downstream **Drug Data API**
 | REST layer            | Spring Web (Spring MVC)             |
 | DrugInfoService persistence | Spring Data JPA + MySQL Driver |
 | DrugDealer persistence | Spring Data Cassandra              |
-| Messaging              | Spring Kafka                       |
+| Messaging              | Spring Cloud Stream (Kafka binder — `spring-cloud-stream-binder-kafka`) |
 | Outbound HTTP           | `java.net.http.HttpClient` (or Spring `RestClient`) |
 | Build tool              | Maven or Gradle (implementer's choice) |
 | Containerization         | Docker + Docker Compose            |
@@ -301,23 +302,30 @@ spring:
     hibernate:
       ddl-auto: ${JPA_DDL_AUTO:validate}
     show-sql: false
-  kafka:
-    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
-    producer:
-      key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
-      acks: all
-      retries: 3
+  cloud:
+    function:
+      definition: drugInfoProducer
+    stream:
+      kafka:
+        binder:
+          brokers: ${KAFKA_BOOTSTRAP_SERVERS}
+          producer-properties:
+            acks: all
+            retries: 3
+        bindings:
+          drugInfoProducer-out-0:
+            producer:
+              messageKeyExpression: headers['eventId']
+      bindings:
+        drugInfoProducer-out-0:
+          destination: ${KAFKA_TOPIC_DRUG_INFO:drugInfo}
+          content-type: application/json
 
 drug-data-api:
   base-url: ${DRUG_DATA_API_BASE_URL}
   connect-timeout-ms: ${HTTP_CONNECT_TIMEOUT_MS:3000}
   request-timeout-ms: ${HTTP_REQUEST_TIMEOUT_MS:5000}
   write-max-retries: ${HTTP_WRITE_MAX_RETRIES:3}
-
-kafka:
-  topic:
-    drug-info: ${KAFKA_TOPIC_DRUG_INFO:drugInfo}
 ```
 
 ### DrugDealer `application.yml` (placeholders only)
@@ -332,18 +340,24 @@ spring:
       local-datacenter: ${CASSANDRA_DATACENTER:datacenter1}
       username: ${CASSANDRA_USERNAME}
       password: ${CASSANDRA_PASSWORD}
-  kafka:
-    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
-    consumer:
-      group-id: ${KAFKA_CONSUMER_GROUP_DRUGDEALER:drugdealer-group}
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring.json.trusted.packages: com.example.drugdealer.model
-
-kafka:
-  topic:
-    drug-info: ${KAFKA_TOPIC_DRUG_INFO:drugInfo}
+  cloud:
+    function:
+      definition: drugInfoConsumer
+    stream:
+      kafka:
+        binder:
+          brokers: ${KAFKA_BOOTSTRAP_SERVERS}
+        bindings:
+          drugInfoConsumer-in-0:
+            consumer:
+              ackMode: MANUAL
+              enableDlq: true
+              dlqName: ${KAFKA_TOPIC_DRUG_INFO:drugInfo}.DLQ
+      bindings:
+        drugInfoConsumer-in-0:
+          destination: ${KAFKA_TOPIC_DRUG_INFO:drugInfo}
+          group: ${KAFKA_CONSUMER_GROUP_DRUGDEALER:drugdealer-group}
+          content-type: application/json
 ```
 
 ### Docker Compose Services (placeholders only)
@@ -469,9 +483,9 @@ No credentials, hostnames, or connection strings are hard-coded anywhere; all ar
 
 - **Goal:** Every successful `/saveDrugInfo` call publishes a correctly formed event to topic `drugInfo`.
 - **Objective:**
-  - Configure `KafkaTemplate<String, DrugInfoEvent>` with `JsonSerializer`.
+  - Add `spring-cloud-stream` and `spring-cloud-stream-binder-kafka` dependencies; configure the `drugInfoProducer-out-0` binding per Section 7.
   - Implement `DrugInfoEvent` / `DrugInfoData` model classes matching Section 5 schema exactly.
-  - After successful MySQL save, construct and publish the event (keyed by `eventId`) to `${KAFKA_TOPIC_DRUG_INFO}`.
+  - After successful MySQL save, construct the event, wrap it as a `Message<DrugInfoEvent>` with the `eventId` header, and publish via `StreamBridge.send("drugInfoProducer-out-0", message)`.
   - Add logging for publish success/failure; ensure publish failure does not affect REST response.
 - **Acceptance criteria:**
   - After a successful `POST /saveDrugInfo` call, a message is observable on topic `drugInfo` (verified via CLI consumer or test harness) whose JSON body matches the Section 5 schema field-for-field, with `data` populated from the original request.
@@ -486,13 +500,13 @@ No credentials, hostnames, or connection strings are hard-coded anywhere; all ar
   - Create Cassandra keyspace and `consumed_drug_events` table per Section 3 DDL.
   - Implement `ConsumedDrugEvent` entity with composite primary key class defining `event_type` as partition key and `event_id` as clustering key.
   - Implement `ConsumedDrugEventRepository extends CassandraRepository<...>`.
-  - Implement `@KafkaListener` bound to `drugInfo` topic with `JsonDeserializer` configured with explicit trusted packages.
+  - Add `spring-cloud-stream` and `spring-cloud-stream-binder-kafka` dependencies; implement a `Consumer<DrugInfoEvent>` functional bean (`drugInfoConsumer`) bound via `drugInfoConsumer-in-0` per Section 7.
   - Map incoming `DrugInfoEvent` to `ConsumedDrugEvent`, setting `consumed_at` to current server time, and save via repository.
-  - Implement basic error handling for deserialization failures (log + skip, or route to DLT topic).
+  - Implement basic error handling for conversion/processing failures (log + skip, or route to the configured DLQ topic).
 - **Acceptance criteria:**
   - Publishing a valid event to `drugInfo` (matching Section 5 schema) results in a corresponding row appearing in `consumed_drug_events` within a few seconds, with all fields correctly mapped.
   - Querying Cassandra by `event_type = 'drug.info.requested'` returns the row, confirming partition key behavior.
-  - A malformed (non-JSON or schema-mismatched) message on the topic does not crash the consumer process; the consumer continues processing subsequent valid messages.
+  - A malformed (non-JSON or schema-mismatched) message on the topic does not crash the consumer process; it is routed to the DLQ topic and the consumer continues processing subsequent valid messages.
 
 ---
 
